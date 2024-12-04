@@ -257,6 +257,22 @@ func resourceDeliveryStream() *schema.Resource {
 					},
 				}
 			}
+			includeExcludeElem := func() *schema.Resource {
+				return &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"include": {
+							Type:     schema.TypeSet,
+							Optional: true,
+							Elem:     &schema.Schema{Type: schema.TypeString},
+						},
+						"exclude": {
+							Type:     schema.TypeSet,
+							Optional: true,
+							Elem:     &schema.Schema{Type: schema.TypeString},
+						},
+					},
+				}
+			}
 			s3ConfigurationElem := func() *schema.Resource {
 				return &schema.Resource{
 					Schema: map[string]*schema.Schema{
@@ -365,6 +381,112 @@ func resourceDeliveryStream() *schema.Resource {
 						return strings.ToLower(value)
 					},
 					ValidateDiagFunc: enum.Validate[destinationType](),
+				},
+				"database_source_configuration": {
+					Type:     schema.TypeList,
+					Optional: true,
+					ForceNew: true,
+					MaxItems: 1,
+					ConflictsWith: []string{
+						"kinesis_source_configuration",
+						"msk_source_configuration",
+					},
+					Elem: &schema.Resource{
+						Schema: map[string]*schema.Schema{
+							"authentication_configuration": {
+								Type:     schema.TypeList,
+								Required: true,
+								MaxItems: 1,
+								Elem: &schema.Resource{
+									Schema: map[string]*schema.Schema{
+										"role_arn": {
+											Type:         schema.TypeString,
+											Required:     true,
+											ValidateFunc: verify.ValidARN,
+										},
+										"secret_manager_arn": {
+											Type:         schema.TypeString,
+											Required:     true,
+											ValidateFunc: verify.ValidARN,
+										},
+									},
+								},
+							},
+							"vpc_configuration": {
+								Type:     schema.TypeList,
+								Required: true,
+								MaxItems: 1,
+								Elem: &schema.Resource{
+									Schema: map[string]*schema.Schema{
+										"role_arn": {
+											Type:         schema.TypeString,
+											Required:     true,
+											ValidateFunc: verify.ValidARN,
+										},
+										"security_group_ids": {
+											Type:     schema.TypeSet,
+											Required: true,
+											Elem:     &schema.Schema{Type: schema.TypeString},
+										},
+										"subnet_ids": {
+											Type:     schema.TypeSet,
+											Required: true,
+											Elem:     &schema.Schema{Type: schema.TypeString},
+										},
+									},
+								},
+							},
+							"databases": {
+								Type:     schema.TypeList,
+								Required: true,
+								MaxItems: 1,
+								Elem:     includeExcludeElem(),
+							},
+							"endpoint": {
+								Type:     schema.TypeString,
+								Required: true,
+							},
+							"port": {
+								Type:     schema.TypeInt,
+								Required: true,
+							},
+							"snapshot_watermark_table": {
+								Type:     schema.TypeString,
+								Required: true,
+							},
+							"tables": {
+								Type:     schema.TypeList,
+								Required: true,
+								Elem:     includeExcludeElem(),
+							},
+							"type": {
+								Type:     schema.TypeString,
+								Required: true,
+								ValidateFunc: validation.StringInSlice([]string{
+									string(types.DatabaseTypeMySQL),
+									string(types.DatabaseTypePostgreSQL),
+								}, false),
+							},
+							"columns": {
+								Type:     schema.TypeList,
+								Optional: true,
+								Elem:     includeExcludeElem(),
+							},
+							"ssl_mode": {
+								Type:     schema.TypeString,
+								Optional: true,
+								ValidateFunc: validation.StringInSlice([]string{
+									string(types.SSLModeDisabled),
+									string(types.SSLModeEnabled),
+								}, false),
+							},
+							"surrogate_keys": {
+								Type:     schema.TypeList,
+								Optional: true,
+								Elem:     &schema.Schema{Type: schema.TypeString},
+							},
+						},
+					},
 				},
 				"destination_id": {
 					Type:     schema.TypeString,
@@ -1488,6 +1610,9 @@ func resourceDeliveryStreamCreate(ctx context.Context, d *schema.ResourceData, m
 	} else if v, ok := d.GetOk("msk_source_configuration"); ok && len(v.([]interface{})) > 0 && v.([]interface{})[0] != nil {
 		input.DeliveryStreamType = types.DeliveryStreamTypeMSKAsSource
 		input.MSKSourceConfiguration = expandMSKSourceConfiguration(v.([]interface{})[0].(map[string]interface{}))
+	} else if v, ok := d.GetOk("database_source_configuration"); ok && len(v.([]interface{})) > 0 && v.([]interface{})[0] != nil {
+		input.DeliveryStreamType = types.DeliveryStreamTypeDatabaseAsSource
+		input.DatabaseSourceConfiguration = expandDatabaseSourceConfiguration(v.([]interface{})[0].(map[string]interface{}))
 	}
 
 	switch v := destinationType(d.Get(names.AttrDestination).(string)); v {
@@ -1592,6 +1717,11 @@ func resourceDeliveryStreamRead(ctx context.Context, d *schema.ResourceData, met
 		if v := v.MSKSourceDescription; v != nil {
 			if err := d.Set("msk_source_configuration", []interface{}{flattenMSKSourceDescription(v)}); err != nil {
 				return sdkdiag.AppendErrorf(diags, "setting msk_source_configuration: %s", err)
+			}
+		}
+		if v := v.DatabaseSourceDescription; v != nil {
+			if err := d.Set("database_source_configuration", []interface{}{flattenDatabaseSourceDescription(v)}); err != nil {
+				return sdkdiag.AppendErrorf(diags, "setting database_source_configuration: %s", err)
 			}
 		}
 	}
@@ -3517,6 +3647,264 @@ func expandAuthenticationConfiguration(tfMap map[string]interface{}) *types.Auth
 	}
 
 	return apiObject
+}
+
+func expandIncludeExcludeList(tfMap map[string]interface{}, target IncludeExcludeList) {
+	if include, ok := tfMap["include"].(*schema.Set); ok && include.Len() > 0 {
+		target.SetInclude(flex.ExpandStringSet(include))
+	}
+	if exclude, ok := tfMap["exclude"].(*schema.Set); ok && exclude.Len() > 0 {
+		target.SetExclude(flex.ExpandStringSet(exclude))
+	}
+}
+
+func expandDatabaseSourceConfiguration(tfMap map[string]interface{}) *types.DatabaseSourceConfiguration {
+	if tfMap == nil {
+		return nil
+	}
+
+	apiObject := &types.DatabaseSourceConfiguration{}
+
+	if v, ok := tfMap["authentication_configuration"].([]interface{}); ok && len(v) > 0 && v[0] != nil {
+		apiObject.DatabaseSourceAuthenticationConfiguration = expandDatabaseSourceAuthenticationConfiguration(v[0].(map[string]interface{}))
+	}
+
+	if v, ok := tfMap["vpc_configuration"].([]interface{}); ok && len(v) > 0 && v[0] != nil {
+		apiObject.DatabaseSourceVPCConfiguration = expandDatabaseSourceVPCConfiguration(v[0].(map[string]interface{}))
+	}
+
+	if v, ok := tfMap["databases"].([]interface{}); ok && len(v) > 0 && v[0] != nil {
+		databases := &types.DatabaseList{}
+		expandIncludeExcludeList(v[0].(map[string]interface{}), databases)
+		apiObject.Databases = databases
+	}
+
+	if v, ok := tfMap["endpoint"].(string); ok && v != "" {
+		apiObject.Endpoint = aws.String(v)
+	}
+
+	if v, ok := tfMap["port"].(int); ok {
+		apiObject.Port = aws.Int32(int32(v))
+	}
+
+	if v, ok := tfMap["snapshot_watermark_table"].(string); ok && v != "" {
+		apiObject.SnapshotWatermarkTable = aws.String(v)
+	}
+
+	if v, ok := tfMap["tables"].([]interface{}); ok && len(v) > 0 && v[0] != nil {
+		tables := &types.DatabaseTableList{}
+		expandIncludeExcludeList(v[0].(map[string]interface{}), tables)
+		apiObject.Tables = tables
+	}
+
+	if v, ok := tfMap["type"].(string); ok && v != "" {
+		apiObject.Type = types.DatabaseType(v)
+	}
+
+	if v, ok := tfMap["columns"].([]interface{}); ok && len(v) > 0 && v[0] != nil {
+		columns := &types.DatabaseColumnList{}
+		expandIncludeExcludeList(v[0].(map[string]interface{}), columns)
+		apiObject.Columns = columns
+	}
+
+	if v, ok := tfMap["ssl_mode"].(string); ok && v != "" {
+		apiObject.SSLMode = types.SSLMode(v)
+	}
+
+	if v, ok := tfMap["surrogate_keys"].([]interface{}); ok && len(v) > 0 {
+		surrogateKeys := make([]string, 0, len(v))
+		for _, k := range v {
+			if k != nil {
+				surrogateKeys = append(surrogateKeys, k.(string))
+			}
+		}
+		apiObject.SurrogateKeys = surrogateKeys
+	}
+
+	return apiObject
+}
+
+func expandDatabaseSourceAuthenticationConfiguration(tfMap map[string]interface{}) *types.DatabaseSourceAuthenticationConfiguration {
+	if tfMap == nil {
+		return nil
+	}
+
+	apiObject := &types.DatabaseSourceAuthenticationConfiguration{}
+
+	if v, ok := tfMap["role_arn"].(string); ok && v != "" {
+		apiObject.RoleARN = aws.String(v)
+	}
+	if v, ok := tfMap["secret_manager_arn"].(string); ok && v != "" {
+		apiObject.SecretManagerARN = aws.String(v)
+	}
+
+	return apiObject
+}
+
+func expandDatabaseSourceVPCConfiguration(tfMap map[string]interface{}) *types.DatabaseSourceVPCConfiguration {
+	if tfMap == nil {
+		return nil
+	}
+
+	apiObject := &types.DatabaseSourceVPCConfiguration{}
+
+	if v, ok := tfMap["role_arn"].(string); ok && v != "" {
+		apiObject.RoleARN = aws.String(v)
+	}
+	if v, ok := tfMap["security_group_ids"].(*schema.Set); ok && v.Len() > 0 {
+		apiObject.SecurityGroupIds = flex.ExpandStringSet(v)
+	}
+	if v, ok := tfMap["subnet_ids"].(*schema.Set); ok && v.Len() > 0 {
+		apiObject.SubnetIds = flex.ExpandStringSet(v)
+	}
+
+	return apiObject
+}
+
+type IncludeExcludeList interface {
+	GetInclude() []string
+	SetInclude([]string)
+	GetExclude() []string
+	SetExclude([]string)
+}
+
+func (d *types.DatabaseColumnList) GetInclude() []string  { return d.Include }
+func (d *types.DatabaseColumnList) SetInclude(s []string) { d.Include = s }
+func (d *types.DatabaseColumnList) GetExclude() []string  { return d.Exclude }
+func (d *types.DatabaseColumnList) SetExclude(s []string) { d.Exclude = s }
+
+func (d *types.DatabaseList) GetInclude() []string  { return d.Include }
+func (d *types.DatabaseList) SetInclude(s []string) { d.Include = s }
+func (d *types.DatabaseList) GetExclude() []string  { return d.Exclude }
+func (d *types.DatabaseList) SetExclude(s []string) { d.Exclude = s }
+
+func (d *types.DatabaseTableList) GetInclude() []string  { return d.Include }
+func (d *types.DatabaseTableList) SetInclude(s []string) { d.Include = s }
+func (d *types.DatabaseTableList) GetExclude() []string  { return d.Exclude }
+func (d *types.DatabaseTableList) SetExclude(s []string) { d.Exclude = s }
+
+func flattenIncludeExcludeList(apiObject IncludeExcludeList) []interface{} {
+	if apiObject == nil {
+		return nil
+	}
+
+	tfMap := map[string]interface{}{}
+
+	if include := apiObject.GetInclude(); len(include) > 0 {
+		tfMap["include"] = include
+	}
+
+	if exclude := apiObject.GetExclude(); len(exclude) > 0 {
+		tfMap["exclude"] = exclude
+	}
+
+	return []interface{}{tfMap}
+}
+
+func flattenDatabaseSourceDescription(apiObject *types.DatabaseSourceDescription) map[string]interface{} {
+	if apiObject == nil {
+		return nil
+	}
+
+	tfMap := map[string]interface{}{}
+
+	if v := apiObject.DatabaseSourceAuthenticationConfiguration; v != nil {
+		tfMap["authentication_configuration"] = flattenDatabaseSourceAuthenticationConfiguration(v)
+	}
+
+	if v := apiObject.DatabaseSourceVPCConfiguration; v != nil {
+		tfMap["vpc_configuration"] = flattenDatabaseSourceVPCConfiguration(v)
+	}
+
+	if v := apiObject.Columns; v != nil {
+		tfMap["columns"] = flattenIncludeExcludeList(v)
+	}
+
+	if v := apiObject.Databases; v != nil {
+		tfMap["databases"] = flattenIncludeExcludeList(v)
+	}
+
+	if v := apiObject.Endpoint; v != nil {
+		tfMap["endpoint"] = aws.ToString(v)
+	}
+
+	if v := apiObject.Port; v != nil {
+		tfMap["port"] = aws.ToInt32(v)
+	}
+
+	if v := apiObject.SSLMode; v != "" {
+		tfMap["ssl_mode"] = string(v)
+	}
+
+	if v := apiObject.SnapshotInfo; len(v) > 0 {
+		tfMap["snapshot_info"] = flattenDatabaseSnapshotInfo(v)
+	}
+
+	if v := apiObject.SnapshotWatermarkTable; v != nil {
+		tfMap["snapshot_watermark_table"] = aws.ToString(v)
+	}
+
+	if v := apiObject.SurrogateKeys; len(v) > 0 {
+		tfMap["surrogate_keys"] = v
+	}
+
+	if v := apiObject.Tables; v != nil {
+		tfMap["tables"] = flattenIncludeExcludeList(v)
+	}
+
+	if v := apiObject.Type; v != "" {
+		tfMap["type"] = string(v)
+	}
+
+	return tfMap
+}
+
+func flattenDatabaseSnapshotInfo(apiObjects []types.DatabaseSnapshotInfo) []interface{} {
+	if len(apiObjects) == 0 {
+		return nil
+	}
+
+	var tfList []interface{}
+
+	for _, apiObject := range apiObjects {
+		tfMap := map[string]interface{}{
+			"last_error_message":  aws.ToString(apiObject.LastErrorMessage),
+			"last_snapshot_end":   aws.ToTime(apiObject.LastSnapshotEnd),
+			"last_snapshot_start": aws.ToTime(apiObject.LastSnapshotStart),
+			"snapshot_status":     string(apiObject.SnapshotStatus),
+		}
+
+		tfList = append(tfList, tfMap)
+	}
+
+	return tfList
+}
+
+func flattenDatabaseSourceAuthenticationConfiguration(apiObject *types.DatabaseSourceAuthenticationConfiguration) []interface{} {
+	if apiObject == nil {
+		return nil
+	}
+
+	tfMap := map[string]interface{}{
+		"role_arn":           aws.ToString(apiObject.RoleARN),
+		"secret_manager_arn": aws.ToString(apiObject.SecretManagerARN),
+	}
+
+	return []interface{}{tfMap}
+}
+
+func flattenDatabaseSourceVPCConfiguration(apiObject *types.DatabaseSourceVPCConfiguration) []interface{} {
+	if apiObject == nil {
+		return nil
+	}
+
+	tfMap := map[string]interface{}{
+		"role_arn":           aws.ToString(apiObject.RoleARN),
+		"security_group_ids": flex.FlattenStringSet(apiObject.SecurityGroupIds),
+		"subnet_ids":         flex.FlattenStringSet(apiObject.SubnetIds),
+	}
+
+	return []interface{}{tfMap}
 }
 
 func flattenMSKSourceDescription(apiObject *types.MSKSourceDescription) map[string]interface{} {
